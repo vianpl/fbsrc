@@ -32,13 +32,14 @@
 #include <media/videobuf2-vmalloc.h>
 #include <media/videobuf2-memops.h>
 
-#define MODNAME			"fbsrc"
-#define FBSRC_NAME_LEN		32
-#define FBSRC_MIN_WIDTH		320
-#define FBSRC_MIN_HEIGHT	240
-#define FBSRC_MAX_WIDTH		1920
-#define FBSRC_MAX_HEIGHT	1080
-#define FBSRC_MAX_FPS		120
+#define MODNAME				"fbsrc"
+#define FBSRC_MIN_QUEUED_BUFS		2
+#define FBSRC_NAME_LEN			32
+#define FBSRC_MIN_WIDTH			320
+#define FBSRC_MIN_HEIGHT		240
+#define FBSRC_MAX_WIDTH			1920
+#define FBSRC_MAX_HEIGHT		1080
+#define FBSRC_MAX_FPS			120
 
 static void fbsrc_dev_release(struct device *dev)
 {}
@@ -119,6 +120,7 @@ static const struct fbsrc_fmt_desc formats[] = {
 	/* TODO: add more format descriptors */
 };
 
+/* Default format is 720p50 */
 static const struct v4l2_pix_format fbsrc_pix_format = {
 	.width = 1280,
 	.height = 720,
@@ -126,6 +128,12 @@ static const struct v4l2_pix_format fbsrc_pix_format = {
 	.field = V4L2_FIELD_NONE,
 	.bytesperline = 1280 * 2,
 	.sizeimage = 1280 * 720 * 2,
+	.colorspace = V4L2_COLORSPACE_SRGB,
+};
+
+static const struct v4l2_fract fbsrc_fps = {
+	.numerator = 1,
+	.denominator = 60
 };
 
 static inline struct fbsrc_buffer *to_fbsrc_buffer(struct vb2_v4l2_buffer *vb2)
@@ -230,8 +238,8 @@ static int fbsrc_queue_setup(struct vb2_queue *vq,
 
 	fbsrc->field = fbsrc->pix.field;
 
-	if (vq->num_buffers + *nbuffers < 3)
-		*nbuffers = 3 - vq->num_buffers;
+	if (vq->num_buffers + *nbuffers < FBSRC_MIN_QUEUED_BUFS)
+		*nbuffers = FBSRC_MIN_QUEUED_BUFS - vq->num_buffers;
 
 	if (*nplanes)
 		return sizes[0] < fbsrc->pix.sizeimage ? -EINVAL : 0;
@@ -348,8 +356,8 @@ static void fbsrc_fill_pix_format(struct fbsrc *fbsrc,
 	/* Fill v4l2 input src format */
 	fbsrc->pix.width = pix->width;
 	fbsrc->pix.height = pix->height;
-	fbsrc->pix.bytesperline = pix->width * (conv->bits_per_pixel / 8);
-	fbsrc->pix.sizeimage = fbsrc->pix.bytesperline * fbsrc->pix.width;
+	fbsrc->pix.bytesperline = pix->width * (conv->bits_per_pixel >> 3);
+	fbsrc->pix.sizeimage = fbsrc->pix.bytesperline * pix->height;
 	fbsrc->pix.pixelformat = pix->pixelformat;
 	fbsrc->pix.field = pix->field;
 
@@ -369,19 +377,28 @@ static void fbsrc_fill_pix_format(struct fbsrc *fbsrc,
 static int fbsrc_try_fmt_vid_cap(struct file *file, void *priv,
 				 struct v4l2_format *f)
 {
-	struct fbsrc *fbsrc = video_drvdata(file);
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 	const struct fbsrc_fmt_desc *conv;
 
 	conv = fbsrc_get_fmt_desc(pix->pixelformat);
-	if (!conv)
-		return -EINVAL;
+	if (!conv) {
+		pix->pixelformat = fbsrc_pix_format.pixelformat;
+		conv = fbsrc_get_fmt_desc(pix->pixelformat);
+	}
 
-	if(pix->field != V4L2_FIELD_NONE)
-		return -EINVAL;
+	if (pix->width < FBSRC_MIN_WIDTH)
+		pix->width = FBSRC_MIN_WIDTH;
+	if (pix->width > FBSRC_MAX_WIDTH)
+		pix->width = FBSRC_MAX_WIDTH;
+	if (pix->height < FBSRC_MIN_HEIGHT)
+		pix->height = FBSRC_MIN_HEIGHT;
+	if (pix->height > FBSRC_MAX_HEIGHT)
+		pix->height = FBSRC_MAX_HEIGHT;
 
-	pix->bytesperline = pix->width * (conv->bits_per_pixel / 8);
-	pix->sizeimage = fbsrc->pix.bytesperline * fbsrc->pix.width;
+	pix->bytesperline = pix->width * (conv->bits_per_pixel >> 3);
+	pix->sizeimage = pix->bytesperline * pix->height;
+	pix->field = V4L2_FIELD_NONE;
+	pix->colorspace = V4L2_COLORSPACE_SRGB;
 
 	return 0;
 }
@@ -393,10 +410,6 @@ static int fbsrc_s_fmt_vid_cap(struct file *file, void *priv,
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 	int ret;
 
-	/*
-	 * It is not allowed to change the format while buffers for use with
-	 * streaming have already been allocated.
-	 */
 	if (vb2_is_busy(&fbsrc->queue))
 		return -EBUSY;
 
@@ -415,6 +428,7 @@ static int fbsrc_g_fmt_vid_cap(struct file *file, void *priv,
 	struct fbsrc *fbsrc = video_drvdata(file);
 
 	f->fmt.pix = fbsrc->pix;
+
 	return 0;
 }
 
@@ -426,18 +440,8 @@ static int fbsrc_enum_fmt_vid_cap(struct file *file, void *priv,
 
 	strlcpy(f->description, formats[f->index].name, sizeof(f->description));
 	f->pixelformat = formats[f->index].fourcc;
+
 	return 0;
-}
-
-
-static void fbsrc_update_time_interval(struct fbsrc *fbsrc)
-{
-	struct v4l2_fract *timeperframe = &fbsrc->timeperframe;
-	unsigned long nsecs;
-
-	nsecs = (timeperframe->numerator * NSEC_PER_SEC) /
-		timeperframe->denominator;
-	fbsrc->interval = ktime_set(0, nsecs);
 }
 
 static int fbsrc_g_parm(struct file *file, void *priv,
@@ -448,7 +452,18 @@ static int fbsrc_g_parm(struct file *file, void *priv,
 
 	cp->capability = V4L2_CAP_TIMEPERFRAME;
 	cp->timeperframe = fbsrc->timeperframe;
+
 	return 0;
+}
+
+static void fbsrc_update_time_interval(struct fbsrc *fbsrc)
+{
+	struct v4l2_fract *timeperframe = &fbsrc->timeperframe;
+	unsigned long nsecs;
+
+	nsecs = (timeperframe->numerator * NSEC_PER_SEC) /
+		 timeperframe->denominator;
+	fbsrc->interval = ktime_set(0, nsecs);
 }
 
 static int fbsrc_s_parm(struct file *file, void *priv,
@@ -456,13 +471,18 @@ static int fbsrc_s_parm(struct file *file, void *priv,
 {
 	struct fbsrc *fbsrc = video_drvdata(file);
 	struct v4l2_captureparm *cp = &sp->parm.capture;
+	struct v4l2_fract *timeperframe = &cp->timeperframe;
 
 	if (vb2_is_busy(&fbsrc->queue))
 		return -EBUSY;
 
 	cp->capability = V4L2_CAP_TIMEPERFRAME;
-	fbsrc->timeperframe = cp->timeperframe;
+	if (!timeperframe->denominator || !timeperframe->numerator)
+		*timeperframe = fbsrc->timeperframe;
+	else
+		fbsrc->timeperframe = *timeperframe;
 	fbsrc_update_time_interval(fbsrc);
+
 	return 0;
 }
 
@@ -470,6 +490,9 @@ static int fbsrc_enum_framesizes(struct file *file, void *priv,
 				 struct v4l2_frmsizeenum *fsize)
 {
 	if (fsize->index != 0)
+		return -EINVAL;
+
+	if (!fbsrc_get_fmt_desc(fsize->pixel_format))
 		return -EINVAL;
 
 	fsize->type = V4L2_FRMSIZE_TYPE_CONTINUOUS;
@@ -489,10 +512,15 @@ static int fbsrc_enum_frameintervals(struct file *file, void *priv,
 	if (ival->index != 0)
 		return -EINVAL;
 
+	if (!fbsrc_get_fmt_desc(ival->pixel_format) ||
+	    ival->width < FBSRC_MIN_WIDTH || ival->height < FBSRC_MIN_HEIGHT ||
+	    ival->width > FBSRC_MAX_WIDTH || ival->height > FBSRC_MAX_HEIGHT)
+		return -EINVAL;
+
 	ival->type = V4L2_FRMSIZE_TYPE_CONTINUOUS;
 	ival->stepwise.min.numerator = 1;
-	ival->stepwise.min.denominator = 1;
-	ival->stepwise.max.numerator = FBSRC_MAX_FPS;
+	ival->stepwise.min.denominator = FBSRC_MAX_FPS;
+	ival->stepwise.max.numerator = 1;
 	ival->stepwise.max.denominator = 1;
 	ival->stepwise.step.numerator = 1;
 	ival->stepwise.step.denominator = 1;
@@ -509,7 +537,7 @@ static int fbsrc_enum_input(struct file *file, void *priv,
 
 	i->type = V4L2_INPUT_TYPE_CAMERA;
 	strlcpy(i->name, "fbsrc", sizeof(i->name));
-	i->capabilities = V4L2_IN_CAP_CUSTOM_TIMINGS;
+	i->capabilities = 0;
 	i->std = 0;
 
 	return 0;
@@ -555,15 +583,10 @@ static const struct v4l2_ioctl_ops fbsrc_ioctl_ops = {
 	.vidioc_querybuf = vb2_ioctl_querybuf,
 	.vidioc_qbuf = vb2_ioctl_qbuf,
 	.vidioc_dqbuf = vb2_ioctl_dqbuf,
-	.vidioc_expbuf = vb2_ioctl_expbuf,
 	.vidioc_streamon = vb2_ioctl_streamon,
 	.vidioc_streamoff = vb2_ioctl_streamoff,
 };
 
-/*
- * The set of file operations. Note that all these ops are standard core
- * helper functions.
- */
 static const struct v4l2_file_operations fbsrc_fops = {
 	.owner = THIS_MODULE,
 	.open = v4l2_fh_open,
@@ -576,8 +599,6 @@ static const struct v4l2_file_operations fbsrc_fops = {
 
 static int fbsrc_probe(struct platform_device *pdev)
 {
-	static const struct v4l2_fract fps =
-		{ .numerator = 1, .denominator = 60 };
 	struct video_device *vdev;
 	struct fb_info *fb_info;
 	struct vb2_queue *q;
@@ -592,7 +613,7 @@ static int fbsrc_probe(struct platform_device *pdev)
 	fbsrc->pdev = pdev;
 	hrtimer_init(&fbsrc->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	fbsrc->timer.function = fbsrc_timer_work;
-	fbsrc->timeperframe = fps;
+	fbsrc->timeperframe = fbsrc_fps;
 	fbsrc->pix = fbsrc_pix_format;
 	fbsrc_update_time_interval(fbsrc);
 
@@ -606,7 +627,7 @@ static int fbsrc_probe(struct platform_device *pdev)
 	/* Initialize the vb2 queue */
 	q = &fbsrc->queue;
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	q->io_modes = VB2_MMAP | VB2_DMABUF;
+	q->io_modes = VB2_MMAP;
 	q->dev = &pdev->dev;
 	q->drv_priv = fbsrc;
 	q->buf_struct_size = sizeof(struct fbsrc_buffer);
@@ -628,8 +649,7 @@ static int fbsrc_probe(struct platform_device *pdev)
 	vdev->release = video_device_release_empty;
 	vdev->fops = &fbsrc_fops,
 	vdev->ioctl_ops = &fbsrc_ioctl_ops,
-	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
-			    V4L2_CAP_STREAMING;
+	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
 	vdev->lock = &fbsrc->lock;
 	vdev->queue = q;
 	vdev->v4l2_dev = &fbsrc->v4l2_dev;
