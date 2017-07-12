@@ -213,17 +213,19 @@ static enum hrtimer_restart fbsrc_timer_work(struct hrtimer *timer)
 	 */
 	spin_lock(&fbsrc->qlock);
 	list_for_each_entry_safe(buf, node, &fbsrc->buf_list, list) {
-		if (buf != fbsrc->buf) {
-			spin_unlock(&fbsrc->qlock);
-		} else {
+		if (buf == fbsrc->buf) {
 			list_del(&buf->list);
-			spin_unlock(&fbsrc->qlock);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
 			buf->vb.vb2_buf.timestamp = ktime_get_ns();
+#else
+			v4l2_get_timestamp(&buf->vb.timestamp);
+#endif
 			buf->vb.sequence = fbsrc->sequence++;
 			buf->vb.field = fbsrc->field;
 			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 		}
 	}
+	spin_unlock(&fbsrc->qlock);
 
 	hrtimer_forward(&fbsrc->timer, ktime_get(), fbsrc->interval);
 
