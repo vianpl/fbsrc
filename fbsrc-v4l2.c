@@ -232,6 +232,7 @@ static enum hrtimer_restart fbsrc_timer_work(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
 static int fbsrc_queue_setup(struct vb2_queue *vq,
 			     unsigned int *nbuffers, unsigned int *nplanes,
 			     unsigned int sizes[], struct device *alloc_devs[])
@@ -251,6 +252,29 @@ static int fbsrc_queue_setup(struct vb2_queue *vq,
 
 	return 0;
 }
+#else
+static int fbsrc_queue_setup(struct vb2_queue *vq, const void *parg,
+			    unsigned int *nbuffers, unsigned int *nplanes,
+		   	    unsigned int sizes[], void *alloc_ctxs[])
+{
+	struct fbsrc *fbsrc = vb2_get_drv_priv(vq);
+	unsigned long size = fbsrc->pix.sizeimage;
+	const struct v4l2_format *fmt = parg;
+
+	if (*nbuffers < FBSRC_MIN_QUEUED_BUFS)
+		*nbuffers = FBSRC_MIN_QUEUED_BUFS;
+	*nplanes = 1;
+
+	if (fmt) {
+		if (fmt->fmt.pix.sizeimage < size)
+			return -EINVAL;
+		size = fmt->fmt.pix.sizeimage;
+	}
+	sizes[0] = size;
+
+	return 0;
+}
+#endif
 
 static int fbsrc_buffer_prepare(struct vb2_buffer *vb)
 {
@@ -330,6 +354,10 @@ static int fbsrc_querycap(struct file *file, void *priv,
 	strlcpy(cap->card, "fbsrc", sizeof(cap->card));
 	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
 		 dev_name(&fbsrc->pdev->dev));
+	cap->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_READWRITE;
+	cap->device_caps |= V4L2_CAP_VIDEO_CAPTURE;
+	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS |
+			    V4L2_CAP_VIDEO_CAPTURE;
 	return 0;
 }
 
@@ -630,7 +658,9 @@ static int fbsrc_probe(struct platform_device *pdev)
 	q = &fbsrc->queue;
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	q->io_modes = VB2_MMAP;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
 	q->dev = &pdev->dev;
+#endif
 	q->drv_priv = fbsrc;
 	q->buf_struct_size = sizeof(struct fbsrc_buffer);
 	q->ops = &fbsrc_qops;
@@ -651,7 +681,9 @@ static int fbsrc_probe(struct platform_device *pdev)
 	vdev->release = video_device_release_empty;
 	vdev->fops = &fbsrc_fops,
 	vdev->ioctl_ops = &fbsrc_ioctl_ops,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+#endif
 	vdev->lock = &fbsrc->lock;
 	vdev->queue = q;
 	vdev->v4l2_dev = &fbsrc->v4l2_dev;
